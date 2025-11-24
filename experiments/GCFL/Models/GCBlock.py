@@ -1,4 +1,6 @@
-from typing import Optional
+from typing import Optional, Tuple
+
+from typing import Optional, Tuple
 
 import torch
 from torch import nn
@@ -125,6 +127,27 @@ class GCBlock(nn.Module):
         bias = bias3x3 + bias1x1 + biasid
         return kernel, bias
 
+    def get_auxiliary_equivalent_kernel_bias(
+        self,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the combined contribution of the auxiliary branches.
+
+        This helper is used when loading fused weights back into training-time
+        models while keeping the local auxiliary branches intact (variant B).
+        """
+
+        if self.branch_1x1 is None:
+            kernel1x1 = torch.zeros_like(self.branch_3x3[0].weight)
+            bias1x1 = torch.zeros_like(self.branch_3x3[0].weight[:, 0, 0, 0])
+        else:
+            kernel1x1, bias1x1 = self._fuse_conv_bn(self.branch_1x1)
+            kernel1x1 = self._pad_1x1_to_3x3(kernel1x1)
+
+        kernelid, biasid = self._fuse_identity()
+        kernel = kernel1x1 + kernelid
+        bias = bias1x1 + biasid
+        return kernel, bias
+
     def _fuse_conv_bn(
         self, branch: nn.Sequential
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -208,3 +231,120 @@ class GCBlock(nn.Module):
         if self.branch_identity is not None:
             del self.branch_identity
         self.deploy = True
+
+
+def _set_bn_to_identity(bn: nn.BatchNorm2d) -> None:
+    """Reset a :class:`BatchNorm2d` layer to behave like an identity mapping."""
+
+    bn.weight.data.fill_(1.0)
+    bn.bias.data.zero_()
+    bn.running_mean.zero_()
+    bn.running_var.fill_(1.0)
+    if hasattr(bn, "num_batches_tracked"):
+        bn.num_batches_tracked.zero_()
+
+
+def _zero_out_conv_branch(branch: Optional[nn.Sequential]) -> None:
+    """Zero out a convolutional branch without changing its structure."""
+
+    if branch is None:
+        return
+    conv = branch[0]
+    conv.weight.data.zero_()
+    if conv.bias is not None:
+        conv.bias.data.zero_()
+    if len(branch) > 1 and isinstance(branch[1], nn.BatchNorm2d):
+        branch[1].weight.data.zero_()
+        branch[1].bias.data.zero_()
+        branch[1].running_mean.zero_()
+        branch[1].running_var.fill_(1.0)
+        if hasattr(branch[1], "num_batches_tracked"):
+            branch[1].num_batches_tracked.zero_()
+
+
+def build_fused_state_dict(model: nn.Module) -> dict:
+    """Return a deterministic mapping of fused GCBlock parameters.
+
+    The returned dictionary maps ``"<module_name>.weight"`` and
+    ``"<module_name>.bias"`` keys to tensors representing the fully fused
+    3x3 convolution (including 1x1 and identity branches).
+    """
+
+    fused_sd: dict[str, torch.Tensor] = {}
+    for name, module in model.named_modules():
+        if isinstance(module, GCBlock):
+            kernel, bias = module.get_equivalent_kernel_bias()
+            fused_sd[f"{name}.weight"] = kernel.detach().clone()
+            fused_sd[f"{name}.bias"] = bias.detach().clone()
+    return fused_sd
+
+
+def load_fused_weights_into_gc_model(
+    model: nn.Module, fused_sd: dict, variant: str = "A"
+) -> None:
+    """Load fused GCBlock weights back into a training-time model.
+
+    Args:
+        model: Model containing :class:`GCBlock` instances.
+        fused_sd: Fused state dictionary produced by
+            :func:`build_fused_state_dict`.
+        variant: "A" zeroes auxiliary branches (1x1 and identity) each round.
+            "B" preserves local auxiliary weights while adjusting the main
+            3x3 branch so the combined output matches the fused weights.
+    """
+
+    variant = variant.upper()
+    if variant not in {"A", "B"}:
+        raise ValueError(f"Unsupported variant '{variant}'. Use 'A' or 'B'.")
+
+    for name, module in model.named_modules():
+        if not isinstance(module, GCBlock):
+            continue
+
+        weight_key, bias_key = f"{name}.weight", f"{name}.bias"
+        if weight_key not in fused_sd or bias_key not in fused_sd:
+            raise KeyError(f"Missing fused parameters for GCBlock '{name}' in fused_sd.")
+
+        target_kernel = fused_sd[weight_key]
+        target_bias = fused_sd[bias_key]
+
+        # Deploy-mode blocks can load the fused weights directly.
+        if module.deploy:
+            module.reparam_conv.weight.data.copy_(target_kernel)
+            module.reparam_conv.bias.data.copy_(target_bias)
+            continue
+
+        if variant == "A":
+            # Zero auxiliary branches so the 3x3 branch carries the fused weights.
+            _zero_out_conv_branch(module.branch_1x1)
+            if isinstance(module.branch_identity, nn.BatchNorm2d):
+                module.branch_identity.weight.data.zero_()
+                module.branch_identity.bias.data.zero_()
+                module.branch_identity.running_mean.zero_()
+                module.branch_identity.running_var.fill_(1.0)
+                if hasattr(module.branch_identity, "num_batches_tracked"):
+                    module.branch_identity.num_batches_tracked.zero_()
+            else:
+                module.branch_identity = None
+
+            residual_kernel = target_kernel
+            residual_bias = target_bias
+        else:  # variant "B"
+            aux_kernel, aux_bias = module.get_auxiliary_equivalent_kernel_bias()
+            residual_kernel = target_kernel - aux_kernel
+            residual_bias = target_bias - aux_bias
+
+        # Write residual into the 3x3 branch with identity BatchNorm.
+        main_conv = module.branch_3x3[0]
+        main_conv.weight.data.copy_(residual_kernel)
+        if main_conv.bias is not None:
+            main_conv.bias.data.copy_(residual_bias)
+
+        if module.use_bn and len(module.branch_3x3) > 1:
+            _set_bn_to_identity(module.branch_3x3[1])
+        elif main_conv.bias is not None:
+            main_conv.bias.data.copy_(residual_bias)
+        else:
+            # If BN is disabled and no conv bias exists, register bias via BN-like tensor.
+            # This path is unlikely but keeps logic consistent.
+            main_conv.bias = torch.nn.Parameter(residual_bias.clone())
