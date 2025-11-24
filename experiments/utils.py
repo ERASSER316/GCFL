@@ -45,5 +45,22 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+def state_dict_parameter_count(state_dict):
+    return sum(tensor.numel() for tensor in state_dict.values())
+
+
+def state_dict_num_bytes(state_dict):
+    return sum(tensor.numel() * tensor.element_size() for tensor in state_dict.values())
+
+
+def format_num_bytes(num_bytes: float) -> str:
+    suffixes = ["B", "KB", "MB", "GB", "TB"]
+    idx = 0
+    while num_bytes >= 1024 and idx < len(suffixes) - 1:
+        num_bytes /= 1024
+        idx += 1
+    return f"{num_bytes:.2f} {suffixes[idx]}"
+
+
 def get_device(no_cuda=False, gpus='0'):
     return torch.device(f"cuda:{gpus}" if torch.cuda.is_available() and not no_cuda else "cpu")

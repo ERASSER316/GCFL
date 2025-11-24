@@ -18,7 +18,15 @@ from experiments.GCFL.Models.GCBlock import (
     load_fused_weights_into_gc_model,
 )
 from experiments.GCFL.node import BaseNodes
-from experiments.utils import get_device, set_logger, set_seed, str2bool
+from experiments.utils import (
+    format_num_bytes,
+    get_device,
+    set_logger,
+    set_seed,
+    state_dict_num_bytes,
+    state_dict_parameter_count,
+    str2bool,
+)
 
 random.seed(2022)
 
@@ -91,6 +99,7 @@ def train(
     model_name: str,
     use_gcblock: bool,
     gcfl_variant: str,
+    log_comm_to_csv: bool,
 ) -> None:
     nodes = BaseNodes(data_name, data_path, num_nodes, classes_per_node=classes_per_node, batch_size=bs)
 
@@ -118,6 +127,9 @@ def train(
 
     PM_acc = defaultdict(float)
     PMs = defaultdict(dict)
+
+    communication_params = []
+    communication_bytes = []
 
     for i in range(num_nodes):
         PM_acc[i] = -1.0
@@ -149,6 +161,9 @@ def train(
             fused_states = []
             non_gc_states = []
             selected_weights = []
+
+            round_param_count = 0
+            round_byte_count = 0
 
             for c in select_nodes:
                 node_id = c
@@ -204,11 +219,26 @@ def train(
                 logging.info("Round %s | client %s acc: %s", r, node_id, PM_acc[node_id])
 
                 if use_gcblock:
-                    fused_states.append(build_fused_state_dict(net))
-                    non_gc_states.append(
-                        {k: v.detach().clone() for k, v in net.state_dict().items() if not is_gcblock_key(k, gcblock_prefixes)}
-                    )
+                    fused_state = build_fused_state_dict(net)
+                    base_state = {
+                        k: v.detach().clone()
+                        for k, v in net.state_dict().items()
+                        if not is_gcblock_key(k, gcblock_prefixes)
+                    }
+
+                    fused_states.append(fused_state)
+                    non_gc_states.append(base_state)
                     selected_weights.append(client_sample_count[node_id])
+
+                    upload_param_count = state_dict_parameter_count(fused_state) + state_dict_parameter_count(base_state)
+                    upload_byte_count = state_dict_num_bytes(fused_state) + state_dict_num_bytes(base_state)
+                else:
+                    full_state = {k: v.detach().clone() for k, v in net.state_dict().items()}
+                    upload_param_count = state_dict_parameter_count(full_state)
+                    upload_byte_count = state_dict_num_bytes(full_state)
+
+                round_param_count += upload_param_count
+                round_byte_count += upload_byte_count
 
             mean_trained_loss = round(np.mean(all_local_trained_loss), 4)
             mean_trained_acc = round(np.mean(all_local_trained_acc), 4)
@@ -219,6 +249,24 @@ def train(
                 [mean_global_loss, mean_global_acc, mean_trained_loss, mean_trained_acc]
                 + [round(i, 4) for i in PM_acc.values()]
             )
+
+            if round_byte_count:
+                communication_params.append(round_param_count)
+                communication_bytes.append(round_byte_count)
+
+                avg_params = int(np.mean(communication_params))
+                avg_bytes = float(np.mean(communication_bytes))
+
+                logging.info(
+                    "Round:%s | upload_params:%s | upload_bytes:%s | avg_upload_bytes:%s",
+                    r,
+                    round_param_count,
+                    format_num_bytes(round_byte_count),
+                    format_num_bytes(avg_bytes),
+                )
+
+                if log_comm_to_csv:
+                    results[-1].extend([round_param_count, round_byte_count, avg_params, int(avg_bytes)])
             mywriter.writerows(results)
             file.flush()
 
@@ -276,6 +324,9 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="cnn1", choices=["cnn1", "gc_cnn1"], help="model architecture")
     parser.add_argument("--use-gcblock", type=str2bool, default=False, help="enable GCBlock fusion-aware aggregation")
     parser.add_argument("--gcfl-variant", type=str, default="A", choices=["A", "B"], help="GCBlock inflation variant")
+    parser.add_argument(
+        "--log-comm-to-csv", type=str2bool, default=False, help="append communication cost metrics to the output CSV"
+    )
 
     args = parser.parse_args()
     assert args.gpu <= torch.cuda.device_count(), f"--gpu flag should be in range [0,{torch.cuda.device_count() - 1}]"
@@ -320,4 +371,5 @@ if __name__ == "__main__":
         model_name=args.model,
         use_gcblock=use_gcblock,
         gcfl_variant=args.gcfl_variant,
+        log_comm_to_csv=args.log_comm_to_csv,
     )
