@@ -21,16 +21,47 @@ This repository extends the GCFL experiments with GCBlock-style re-parameterizat
 
 ```bash
 python -m experiments.GCFL.Standalone \
-  --data-name fashion-mnist \
+  --data-name cifar10 \
   --data-path data \
   --num-nodes 100 \
   --fraction 0.1 \
   --num-steps 500 \
+  --save-path Results/GCFL_gc_cnn1 \
   --epochs 10 \
   --batch-size 512 \
   --nkernels 16 \
   --model gc_cnn1 \
   --use-gcblock true \
+  --gcfl-variant A \
+  --log-comm-to-csv true
+
+python -m experiments.GCFL.Standalone \
+  --data-name cifar10 \
+  --data-path data \
+  --num-nodes 100 \
+  --fraction 0.1 \
+  --num-steps 500 \
+  --save-path Results/GCFL_gc_cnn1 \
+  --epochs 10 \
+  --batch-size 512 \
+  --nkernels 16 \
+  --model gc_cnn1 \
+  --use-gcblock true \
+  --gcfl-variant B \
+  --log-comm-to-csv true
+
+python -m experiments.GCFL.Standalone \
+  --data-name cifar10 \
+  --data-path data \
+  --num-nodes 100 \
+  --fraction 0.1 \
+  --save-path Results/GCFL_cnn1 \
+  --num-steps 500 \
+  --epochs 10 \
+  --batch-size 512 \
+  --nkernels 16 \
+  --model cnn1 \
+  --use-gcblock false \
   --gcfl-variant A \
   --log-comm-to-csv true
 ```

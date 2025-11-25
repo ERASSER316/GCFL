@@ -168,13 +168,23 @@ class GCBlock(nn.Module):
         return fused_weight, fused_bias
 
     def _fuse_identity(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        情况一：
+            如果use_identity=None说明或者通道数不匹配导致无法建立恒等映射，这个分支就不存在
+            既然不存在，它对结果的贡献就是0，即融合的时候返回一个全0的卷积核和全0的偏置
+        """
+
         if self.branch_identity is None:
             kernel_value = torch.zeros(
                 (self.out_channels, self.in_channels, 3, 3), device=self.branch_3x3[0].weight.device
             )
             bias_value = torch.zeros(self.out_channels, device=kernel_value.device)
             return kernel_value, bias_value
-
+        """
+        情况二：
+            没有BN的纯恒等映射，为了保证输出原样图像，卷积核中心为1，周围为0即可（狄拉克函数形式的卷积核）
+            bias置零
+        """
         if isinstance(self.branch_identity, nn.Identity):
             identity_kernel = torch.zeros(
                 (self.out_channels, self.in_channels, 3, 3), device=self.branch_3x3[0].weight.device
@@ -183,7 +193,12 @@ class GCBlock(nn.Module):
                 identity_kernel[i, i % self.in_channels, 1, 1] = 1
             bias = torch.zeros(self.out_channels, device=identity_kernel.device)
             return identity_kernel, bias
-
+        """
+        情况三：带BN的恒等映射
+            首先构造基础的恒等卷积核，与情况一完全相同
+            然后考虑这个BN参数的提取
+            最终融合进新的卷积核即可
+        """
         # BatchNorm identity branch
         input_dim = self.in_channels
         id_kernel_value = torch.zeros(
@@ -245,7 +260,11 @@ def _set_bn_to_identity(bn: nn.BatchNorm2d) -> None:
 
 
 def _zero_out_conv_branch(branch: Optional[nn.Sequential]) -> None:
-    """Zero out a convolutional branch without changing its structure."""
+    """
+    Zero out a convolutional branch without changing its structure.
+    将目标卷积层weight和bias置零
+    服务于A思路的权重融合匹配
+    """
 
     if branch is None:
         return
@@ -262,7 +281,7 @@ def _zero_out_conv_branch(branch: Optional[nn.Sequential]) -> None:
             branch[1].num_batches_tracked.zero_()
 
 
-def build_fused_state_dict(model: nn.Module) -> dict:
+def build_fused_state_dict(model: nn.Module) -> dict:   #找到模型中GCBlock的部分，进行重参数化后，将等效的权重返回，修剪权重的关键
     """Return a deterministic mapping of fused GCBlock parameters.
 
     The returned dictionary maps ``"<module_name>.weight"`` and
@@ -291,22 +310,26 @@ def load_fused_weights_into_gc_model(
         variant: "A" zeroes auxiliary branches (1x1 and identity) each round.
             "B" preserves local auxiliary weights while adjusting the main
             3x3 branch so the combined output matches the fused weights.
+
+        "A"：每轮都把 1×1 分支和 identity 分支清零，全局融合权重全部写到 3×3 分支里；
+
+        "B"：保留本地的辅助分支（1×1、identity），只调 3×3 这条主分支，让“三者加起来的等效卷积”刚好等于 fused 权重。
     """
 
     variant = variant.upper()
     if variant not in {"A", "B"}:
         raise ValueError(f"Unsupported variant '{variant}'. Use 'A' or 'B'.")
 
-    for name, module in model.named_modules():
+    for name, module in model.named_modules():  #找到GCBlock部分
         if not isinstance(module, GCBlock):
-            continue
+            continue    #不是GCBlock就跳过
 
         weight_key, bias_key = f"{name}.weight", f"{name}.bias"
         if weight_key not in fused_sd or bias_key not in fused_sd:
             raise KeyError(f"Missing fused parameters for GCBlock '{name}' in fused_sd.")
 
-        target_kernel = fused_sd[weight_key]
-        target_bias = fused_sd[bias_key]
+        target_kernel = fused_sd[weight_key]    #取融合后的等效卷积核（3×3 Conv 的权重）
+        target_bias = fused_sd[bias_key]    #取融合后的偏置
 
         # Deploy-mode blocks can load the fused weights directly.
         if module.deploy:
@@ -316,7 +339,15 @@ def load_fused_weights_into_gc_model(
 
         if variant == "A":
             # Zero auxiliary branches so the 3x3 branch carries the fused weights.
+            """
+            核心思想：
+                让 “总输出 = 3×3 分支 + 1×1 分支 + identity 分支 = target 等效卷积”
+                现在我希望：1×1 分支 + identity 分支 = 0，那么 3×3 分支 = target 等效卷积。
+                下次训练时候1*1分支和identity分支从零开始训练
+            """
+            #处理1*1分支，将其置零
             _zero_out_conv_branch(module.branch_1x1)
+            #处理identity分支
             if isinstance(module.branch_identity, nn.BatchNorm2d):
                 module.branch_identity.weight.data.zero_()
                 module.branch_identity.bias.data.zero_()
@@ -326,10 +357,18 @@ def load_fused_weights_into_gc_model(
                     module.branch_identity.num_batches_tracked.zero_()
             else:
                 module.branch_identity = None
-
+            #由于其他分支被归零，所以“总效果全靠等效 3×3 分支”，
             residual_kernel = target_kernel
             residual_bias = target_bias
         else:  # variant "B"
+            """
+            核心思想：
+                先把当前 1×1 + identity 分支的等效卷积算出来（aux_kernel, aux_bias），
+                然后：
+                    3x3_residual = target_kernel - aux_kernel
+                    3x3_bias_residual = target_bias - aux_bias
+                这样“3×3 分支 + 辅助分支 = target 效果”。
+            """
             aux_kernel, aux_bias = module.get_auxiliary_equivalent_kernel_bias()
             residual_kernel = target_kernel - aux_kernel
             residual_bias = target_bias - aux_bias
@@ -342,8 +381,6 @@ def load_fused_weights_into_gc_model(
 
         if module.use_bn and len(module.branch_3x3) > 1:
             _set_bn_to_identity(module.branch_3x3[1])
-        elif main_conv.bias is not None:
-            main_conv.bias.data.copy_(residual_bias)
         else:
             # If BN is disabled and no conv bias exists, register bias via BN-like tensor.
             # This path is unlikely but keeps logic consistent.

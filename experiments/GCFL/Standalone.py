@@ -28,12 +28,12 @@ from experiments.utils import (
     str2bool,
 )
 
-random.seed(2022)
+# Removed global random.seed(2022) to unify seed management in main
 
-
-def build_model(data_name: str, n_kernels: int, model_name: str, device: torch.device):
+def build_model(data_name: str, n_kernels: int, model_name: str, num_classes: int, device: torch.device):
+    # Logic updated to accept num_classes explicitly
     in_channels = 1 if data_name in {"mnist", "fashion-mnist"} else 3
-    out_dim = 100 if data_name == "cifar100" else 10
+    out_dim = num_classes
 
     if model_name == "gc_cnn1":
         model = GC_CNN_1(in_channels=in_channels, n_kernels=n_kernels, out_dim=out_dim)
@@ -44,7 +44,7 @@ def build_model(data_name: str, n_kernels: int, model_name: str, device: torch.d
 
     return model.to(device)
 
-
+#寻找模型中所有GCBlock模块的名称，可以在模型构建的时候进行不止一处的gcblock融合
 def get_gcblock_prefixes(model: torch.nn.Module) -> List[str]:
     return [name for name, module in model.named_modules() if isinstance(module, GCBlock)]
 
@@ -53,7 +53,7 @@ def is_gcblock_key(key: str, prefixes: List[str]) -> bool:
     return any(key == prefix or key.startswith(f"{prefix}.") for prefix in prefixes)
 
 
-def fed_avg_state_dicts(state_dicts: List[Dict], weights: List[float]) -> Dict:
+def fed_avg_state_dicts(state_dicts: List[Dict], weights: List[float]) -> Dict: #传入多个客户端模型的列表和对应的样本数（权重）
     total_weight = float(sum(weights))
     averaged: dict[str, torch.Tensor] = {}
 
@@ -107,12 +107,20 @@ def train(
     eval_sample_count = nodes.eval_sample_count
     test_sample_count = nodes.test_sample_count
 
+    #统计每个客户端的样本总数（该客户端的训练样本数+验证样本数+测试样本数），用于后面聚合时候的加权平均
     client_sample_count = [
         train_sample_count[i] + eval_sample_count[i] + test_sample_count[i]
         for i in range(len(train_sample_count))
     ]
 
-    net_template = build_model(data_name, n_kernels, model_name, device)
+    # Determine total classes for model building
+    # Assuming standard datasets
+    if data_name == "cifar100":
+        total_num_classes = 100
+    else:
+        total_num_classes = 10
+    #根据shell输入构建CNN/GC-CNN模型
+    net_template = build_model(data_name, n_kernels, model_name, total_num_classes, device)
     gcblock_prefixes = get_gcblock_prefixes(net_template)
 
     logging.info(
@@ -123,17 +131,18 @@ def train(
     )
 
     criteria = torch.nn.CrossEntropyLoss()
-    step_iter = trange(steps)
+    step_iter = trange(steps)   #for r in range(steps)的带进度条版本，steps是联邦学习的总轮数
 
-    PM_acc = defaultdict(float)
-    PMs = defaultdict(dict)
-
-    communication_params = []
-    communication_bytes = []
-
-    for i in range(num_nodes):
+    # PM_acc keeps track of the last known accuracy of each client for logging
+    PM_acc = defaultdict(float) #用于存储每个客户端的最新验证准确率，key是客户端索引，value是准确率
+    for i in range(num_nodes):  #初始化每个客户端的验证准确率为-1.0
         PM_acc[i] = -1.0
-        PMs[i] = copy.deepcopy(net_template.state_dict())
+    
+    # Memory Optimization: Removed PMs dictionary. Use a single global state.
+    global_state_dict = copy.deepcopy(net_template.state_dict()) #全局模型参数
+
+    communication_params = [] #用于存储每轮通信的参数数量
+    communication_bytes = [] #用于存储每轮通信的字节数
 
     save_path = Path(save_path)
     save_path.mkdir(parents=True, exist_ok=True)
@@ -145,42 +154,68 @@ def train(
 
     with open(csv_file, "w", newline="") as file:
         mywriter = csv.writer(file, delimiter=",")
+        
+        # Code Quality: Add CSV Header，记录训练数据更新
+        headers = ["Global Loss", "Global Acc", "Mean Local Loss", "Mean Local Acc"]
+        headers.extend([f"Client_{i}_Acc" for i in range(num_nodes)])
+        if log_comm_to_csv:
+            headers.extend(["Round Params", "Round Bytes", "Avg Params", "Avg Bytes"])
+        mywriter.writerow(headers)
 
         for r in step_iter:  # step is round
             frac = fraction
-            select_nodes = random.sample(range(num_nodes), int(frac * num_nodes))
-
-            all_local_trained_loss = []
-            all_local_trained_acc = []
-            all_global_loss = []
-            all_global_acc = []
-            results = []
+            select_nodes = random.sample(range(num_nodes), int(frac * num_nodes))   #select_nodes是一个列表，包含了本次轮次中被选中的客户端索引
 
             logging.info("#----Round:%s----#", r)
 
-            fused_states = []
-            non_gc_states = []
-            selected_weights = []
+            # --- Critical Fix: Global Evaluation ---
+            # Calculate Global Accuracy BEFORE training
+            net_template.load_state_dict(global_state_dict)
+            net_template.eval()
+            
+            total_eval_loss = 0
+            total_eval_acc = 0
+            total_eval_samples = 0
+            
+            # Evaluate on a subset or all test loaders to get Global Performance
+            # Here we iterate all test loaders to get accurate global stats
+            with torch.no_grad():
+                for node_id in range(num_nodes):    #遍历所有客户端
+                    for batch in nodes.test_loaders[node_id]:    #遍历当前客户端的测试集
+                        img, label = tuple(t.to(device) for t in batch)    #将当前客户端的测试集数据转换为tensor
+                        pred = unpack_prediction(net_template(img))    #通过模型预测当前客户端的测试集数据
+                        loss = criteria(pred, label)    #计算损失
+                        total_eval_loss += loss.item() * len(label)    #累加损失
+                        total_eval_acc += pred.argmax(1).eq(label).sum().item()    #累加正确预测数
+                        total_eval_samples += len(label)    #累加样本数
+            
+            global_loss = total_eval_loss / total_eval_samples if total_eval_samples > 0 else 0 #计算全局损失
+            global_acc = total_eval_acc / total_eval_samples if total_eval_samples > 0 else 0 #计算全局准确率
+            
+            # ---------------------------------------
 
-            round_param_count = 0
-            round_byte_count = 0
+            all_local_trained_loss = [] #用于存储每个客户端的训练损失
+            all_local_trained_acc = [] #用于存储每个客户端的训练准确率
+            
+            fused_states = [] #用于存储每轮通信的融合状态
+            non_gc_states = [] #用于存储每轮通信的非融合状态
+            selected_weights = [] #用于存储每轮通信的权重
 
-            for c in select_nodes:
+            round_param_count = 0 #用于存储每轮通信的参数数量
+            round_byte_count = 0 #用于存储每轮通信的字节数
+
+            for c in select_nodes:  #遍历本次轮次中被选中的fraction比例的客户端，c是客户端索引
                 node_id = c
 
                 net = copy.deepcopy(net_template)
-                net.load_state_dict(PMs[node_id])
+                # Memory Optimization: Load from global state, not PMs
+                net.load_state_dict(global_state_dict) #初始化当前客户端的模型参数为全局模型参数
                 net = net.to(device)
 
                 if optim == "sgd":
                     optimizer = torch.optim.SGD(params=net.parameters(), lr=inner_lr, momentum=0.9, weight_decay=wd)
                 else:
                     optimizer = torch.optim.Adam(params=net.parameters(), lr=inner_lr)
-
-                global_loss = 0
-                global_acc = 0
-                all_global_loss.append(global_loss)
-                all_global_acc.append(global_acc)
 
                 net.train()
                 for _ in range(epochs):
@@ -190,11 +225,10 @@ def train(
                         pred = unpack_prediction(net(img))
                         loss = criteria(pred, label)
                         loss.backward()
-                        torch.nn.utils.clip_grad_norm_(net.parameters(), 50)
+                        torch.nn.utils.clip_grad_norm_(net.parameters(), 50)    #梯度裁剪，防止梯度爆炸
                         optimizer.step()
 
-                PMs[node_id] = copy.deepcopy(net.state_dict())
-
+                # Local Evaluation
                 net.eval()
                 with torch.no_grad():
                     test_acc = 0
@@ -229,26 +263,29 @@ def train(
                     fused_states.append(fused_state)
                     non_gc_states.append(base_state)
                     selected_weights.append(client_sample_count[node_id])
-
+                    #算这轮该客户端上传的参数个数和字节数
                     upload_param_count = state_dict_parameter_count(fused_state) + state_dict_parameter_count(base_state)
                     upload_byte_count = state_dict_num_bytes(fused_state) + state_dict_num_bytes(base_state)
                 else:
                     full_state = {k: v.detach().clone() for k, v in net.state_dict().items()}
+                    
+                    # For standard FedAvg, we treat full state as non_gc_state for unified aggregation logic below
+                    # or aggregate separately. Here we fit into the lists:
+                    non_gc_states.append(full_state) # Treat all as base
+                    selected_weights.append(client_sample_count[node_id])
+                    
                     upload_param_count = state_dict_parameter_count(full_state)
                     upload_byte_count = state_dict_num_bytes(full_state)
-
+                #这两个在所有选中客户端上累加，得到这一轮所有客户端总上传量
                 round_param_count += upload_param_count
                 round_byte_count += upload_byte_count
 
             mean_trained_loss = round(np.mean(all_local_trained_loss), 4)
             mean_trained_acc = round(np.mean(all_local_trained_acc), 4)
-            mean_global_loss = 0
-            mean_global_acc = 0
-
-            results.append(
-                [mean_global_loss, mean_global_acc, mean_trained_loss, mean_trained_acc]
-                + [round(i, 4) for i in PM_acc.values()]
-            )
+            
+            # Prepare results row
+            row = [global_loss, global_acc, mean_trained_loss, mean_trained_acc]
+            row.extend([round(PM_acc[i], 4) for i in range(num_nodes)])
 
             if round_byte_count:
                 communication_params.append(round_param_count)
@@ -266,28 +303,34 @@ def train(
                 )
 
                 if log_comm_to_csv:
-                    results[-1].extend([round_param_count, round_byte_count, avg_params, int(avg_bytes)])
+                    row.extend([round_param_count, round_byte_count, avg_params, int(avg_bytes)])
+            
+            results = [row]
             mywriter.writerows(results)
             file.flush()
 
             logging.info(
-                "Round:%s | mean_trained_loss:%s | mean_trained_acc:%s", r, mean_trained_loss, mean_trained_acc
+                "Round:%s | Global Acc: %.4f | Mean Local Acc: %.4f", r, global_acc, mean_trained_acc
             )
 
+            # --- Aggregation Step ---
             if use_gcblock and fused_states:
                 fused_global = fed_avg_state_dicts(fused_states, selected_weights)
                 non_gc_global = fed_avg_state_dicts(non_gc_states, selected_weights)
 
-                global_model = copy.deepcopy(net_template)
-                base_state = global_model.state_dict()
+                # Update global model
+                # Note: We update the net_template, then extract state_dict to global_state_dict
+                base_state = net_template.state_dict()
                 for k, v in non_gc_global.items():
                     base_state[k] = v
-                global_model.load_state_dict(base_state, strict=False)
-                load_fused_weights_into_gc_model(global_model, fused_global, variant=gcfl_variant)
-                broadcast_state = global_model.state_dict()
-
-                for i in range(num_nodes):
-                    PMs[i] = copy.deepcopy(broadcast_state)
+                
+                net_template.load_state_dict(base_state, strict=False)
+                load_fused_weights_into_gc_model(net_template, fused_global, variant=gcfl_variant)  #GCBlock部分的权重融合
+                global_state_dict = copy.deepcopy(net_template.state_dict())
+            else:
+                # Standard FedAvg Aggregation
+                if non_gc_states: # non_gc_states holds full states if use_gcblock is False
+                    global_state_dict = fed_avg_state_dicts(non_gc_states, selected_weights)
 
         logging.info("Homogeneous Standalone Training finished successfully!")
 
@@ -337,9 +380,9 @@ if __name__ == "__main__":
     device = get_device(gpus=args.gpu)
 
     if args.data_name == "cifar10":
-        args.classes_per_node = 10
+        args.classes_per_node = 2
     elif args.data_name == "cifar100":
-        args.classes_per_node = 100
+        args.classes_per_node = 10
     else:
         args.classes_per_node = 2
 
