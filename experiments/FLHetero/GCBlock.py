@@ -1,7 +1,5 @@
 from typing import Optional, Tuple
 
-from typing import Optional, Tuple
-
 import torch
 from torch import nn
 
@@ -11,9 +9,10 @@ class GCBlock(nn.Module):
 
     This block follows a multi-branch design during training and is fused
     into a single :class:`~torch.nn.Conv2d` layer for deployment. The main
-    branch uses a 3x3 convolution. Optional 1x1 and identity branches can be
-    enabled via the constructor. BatchNorm layers are fused into the
-    resulting convolution when ``switch_to_deploy`` is called.
+    branch uses a configurable convolution kernel. Optional secondary 3x3,
+    1x1 and identity branches can be enabled via the constructor. BatchNorm
+    layers are fused into the resulting convolution when ``switch_to_deploy``
+    is called.
     """
 
     def __init__(
@@ -21,7 +20,9 @@ class GCBlock(nn.Module):
         in_channels: int,
         out_channels: int,
         stride: int = 1,
-        padding: int = 1,
+        padding: Optional[int] = None,
+        kernel_size: int = 3,
+        use_second_3x3: bool = True,
         use_identity: bool = True,
         use_1x1: bool = True,
         use_bn: bool = True,
@@ -31,7 +32,9 @@ class GCBlock(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.stride = stride
-        self.padding = padding
+        self.kernel_size = kernel_size
+        self.padding = (kernel_size // 2) if padding is None else padding
+        self.use_second_3x3 = use_second_3x3
         self.use_identity = use_identity
         self.use_1x1 = use_1x1
         self.use_bn = use_bn
@@ -41,19 +44,31 @@ class GCBlock(nn.Module):
             self.reparam_conv = nn.Conv2d(
                 in_channels,
                 out_channels,
-                kernel_size=3,
+                kernel_size=kernel_size,
                 stride=stride,
-                padding=padding,
+                padding=self.padding,
                 bias=True,
             )
         else:
-            self.branch_3x3 = self._conv_bn(
+            self.path_3x3_1 = self._conv_bn(
                 in_channels,
                 out_channels,
-                kernel_size=3,
+                kernel_size=kernel_size,
                 stride=stride,
-                padding=padding,
+                padding=self.padding,
             )
+
+            self.path_3x3_2: Optional[nn.Sequential]
+            if use_second_3x3:
+                self.path_3x3_2 = self._conv_bn(
+                    in_channels,
+                    out_channels,
+                    kernel_size=kernel_size,
+                    stride=stride,
+                    padding=self.padding,
+                )
+            else:
+                self.path_3x3_2 = None
 
             self.branch_1x1: Optional[nn.Sequential]
             if use_1x1:
@@ -103,32 +118,52 @@ class GCBlock(nn.Module):
         if self.deploy:
             return self.activation(self.reparam_conv(x))
 
-        out = self.branch_3x3(x)
+        out = self.path_3x3_1(x)
+        if self.path_3x3_2 is not None:
+            out = out + self.path_3x3_2(x)
         if self.branch_1x1 is not None:
             out = out + self.branch_1x1(x)
         if self.branch_identity is not None:
             out = out + self.branch_identity(x)
         return self.activation(out)
 
-    def get_equivalent_kernel_bias(self) -> tuple[torch.Tensor, torch.Tensor]:
-        kernel3x3, bias3x3 = self._fuse_conv_bn(self.branch_3x3)
+    def get_equivalent_kernel_bias(
+        self, lambda_3x3: float = 1.0, lambda_1x1: float = 1.0, lambda_id: float = 1.0
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        kernel3x3_1, bias3x3_1 = self._fuse_conv_bn(self.path_3x3_1)
 
-        kernel1x1 = bias1x1 = None
+        if self.path_3x3_2 is not None:
+            kernel3x3_2, bias3x3_2 = self._fuse_conv_bn(self.path_3x3_2)
+        else:
+            kernel3x3_2 = torch.zeros_like(kernel3x3_1)
+            bias3x3_2 = torch.zeros_like(bias3x3_1)
+
         if self.branch_1x1 is not None:
             kernel1x1, bias1x1 = self._fuse_conv_bn(self.branch_1x1)
-            kernel1x1 = self._pad_1x1_to_3x3(kernel1x1)
+            kernel1x1 = self._pad_1x1_to_kxk(kernel1x1)
         else:
-            kernel1x1 = torch.zeros_like(kernel3x3)
-            bias1x1 = torch.zeros_like(bias3x3)
+            kernel1x1 = torch.zeros_like(kernel3x3_1)
+            bias1x1 = torch.zeros_like(bias3x3_1)
 
         kernelid, biasid = self._fuse_identity()
 
-        kernel = kernel3x3 + kernel1x1 + kernelid
-        bias = bias3x3 + bias1x1 + biasid
+        kernel = (
+            lambda_3x3 * (kernel3x3_1 + kernel3x3_2)
+            + lambda_1x1 * kernel1x1
+            + lambda_id * kernelid
+        )
+        bias = (
+            lambda_3x3 * (bias3x3_1 + bias3x3_2)
+            + lambda_1x1 * bias1x1
+            + lambda_id * biasid
+        )
         return kernel, bias
 
     def get_auxiliary_equivalent_kernel_bias(
         self,
+        lambda_3x3: float = 1.0,
+        lambda_1x1: float = 1.0,
+        lambda_id: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return the combined contribution of the auxiliary branches.
 
@@ -136,21 +171,25 @@ class GCBlock(nn.Module):
         models while keeping the local auxiliary branches intact (variant B).
         """
 
+        if self.path_3x3_2 is None:
+            kernel3x3_2 = torch.zeros_like(self.path_3x3_1[0].weight)
+            bias3x3_2 = torch.zeros_like(self.path_3x3_1[0].weight[:, 0, 0, 0])
+        else:
+            kernel3x3_2, bias3x3_2 = self._fuse_conv_bn(self.path_3x3_2)
+
         if self.branch_1x1 is None:
-            kernel1x1 = torch.zeros_like(self.branch_3x3[0].weight)
-            bias1x1 = torch.zeros_like(self.branch_3x3[0].weight[:, 0, 0, 0])
+            kernel1x1 = torch.zeros_like(self.path_3x3_1[0].weight)
+            bias1x1 = torch.zeros_like(self.path_3x3_1[0].weight[:, 0, 0, 0])
         else:
             kernel1x1, bias1x1 = self._fuse_conv_bn(self.branch_1x1)
-            kernel1x1 = self._pad_1x1_to_3x3(kernel1x1)
+            kernel1x1 = self._pad_1x1_to_kxk(kernel1x1)
 
         kernelid, biasid = self._fuse_identity()
-        kernel = kernel1x1 + kernelid
-        bias = bias1x1 + biasid
+        kernel = lambda_3x3 * kernel3x3_2 + lambda_1x1 * kernel1x1 + lambda_id * kernelid
+        bias = lambda_3x3 * bias3x3_2 + lambda_1x1 * bias1x1 + lambda_id * biasid
         return kernel, bias
 
-    def _fuse_conv_bn(
-        self, branch: nn.Sequential
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _fuse_conv_bn(self, branch: nn.Sequential) -> tuple[torch.Tensor, torch.Tensor]:
         conv = branch[0]
         bn = branch[1] if self.use_bn and len(branch) > 1 else None
 
@@ -176,7 +215,8 @@ class GCBlock(nn.Module):
 
         if self.branch_identity is None:
             kernel_value = torch.zeros(
-                (self.out_channels, self.in_channels, 3, 3), device=self.branch_3x3[0].weight.device
+                (self.out_channels, self.in_channels, self.kernel_size, self.kernel_size),
+                device=self.path_3x3_1[0].weight.device,
             )
             bias_value = torch.zeros(self.out_channels, device=kernel_value.device)
             return kernel_value, bias_value
@@ -187,10 +227,12 @@ class GCBlock(nn.Module):
         """
         if isinstance(self.branch_identity, nn.Identity):
             identity_kernel = torch.zeros(
-                (self.out_channels, self.in_channels, 3, 3), device=self.branch_3x3[0].weight.device
+                (self.out_channels, self.in_channels, self.kernel_size, self.kernel_size),
+                device=self.path_3x3_1[0].weight.device,
             )
             for i in range(self.out_channels):
-                identity_kernel[i, i % self.in_channels, 1, 1] = 1
+                center = self.kernel_size // 2
+                identity_kernel[i, i % self.in_channels, center, center] = 1
             bias = torch.zeros(self.out_channels, device=identity_kernel.device)
             return identity_kernel, bias
         """
@@ -202,10 +244,12 @@ class GCBlock(nn.Module):
         # BatchNorm identity branch
         input_dim = self.in_channels
         id_kernel_value = torch.zeros(
-            (self.out_channels, input_dim, 3, 3), device=self.branch_3x3[0].weight.device
+            (self.out_channels, input_dim, self.kernel_size, self.kernel_size),
+            device=self.path_3x3_1[0].weight.device,
         )
         for i in range(self.out_channels):
-            id_kernel_value[i, i % input_dim, 1, 1] = 1
+            center = self.kernel_size // 2
+            id_kernel_value[i, i % input_dim, center, center] = 1
 
         running_mean = self.branch_identity.running_mean
         running_var = self.branch_identity.running_var
@@ -218,10 +262,10 @@ class GCBlock(nn.Module):
         fused_bias = beta - running_mean * gamma / std
         return fused_kernel, fused_bias
 
-    @staticmethod
-    def _pad_1x1_to_3x3(kernel: torch.Tensor) -> torch.Tensor:
+    def _pad_1x1_to_kxk(self, kernel: torch.Tensor) -> torch.Tensor:
         if kernel.size(2) == 1:
-            return nn.functional.pad(kernel, [1, 1, 1, 1])
+            pad_total = self.kernel_size // 2
+            return nn.functional.pad(kernel, [pad_total, pad_total, pad_total, pad_total])
         return kernel
 
     def switch_to_deploy(self) -> None:
@@ -231,7 +275,7 @@ class GCBlock(nn.Module):
         self.reparam_conv = nn.Conv2d(
             self.in_channels,
             self.out_channels,
-            kernel_size=3,
+            kernel_size=self.kernel_size,
             stride=self.stride,
             padding=self.padding,
             bias=True,
@@ -240,7 +284,9 @@ class GCBlock(nn.Module):
         self.reparam_conv.bias.data = bias
 
         # Clean training-time branches
-        del self.branch_3x3
+        del self.path_3x3_1
+        if self.path_3x3_2 is not None:
+            del self.path_3x3_2
         if self.branch_1x1 is not None:
             del self.branch_1x1
         if self.branch_identity is not None:
@@ -281,25 +327,45 @@ def _zero_out_conv_branch(branch: Optional[nn.Sequential]) -> None:
             branch[1].num_batches_tracked.zero_()
 
 
-def build_fused_state_dict(model: nn.Module) -> dict:   #找到模型中GCBlock的部分，进行重参数化后，将等效的权重返回，修剪权重的关键
+def build_fused_state_dict(
+    model: nn.Module,
+    lambda_3x3: float = 1.0,
+    lambda_1x1: float = 1.0,
+    lambda_id: float = 1.0,
+) -> dict:
     """Return a deterministic mapping of fused GCBlock parameters.
 
     The returned dictionary maps ``"<module_name>.weight"`` and
     ``"<module_name>.bias"`` keys to tensors representing the fully fused
-    3x3 convolution (including 1x1 and identity branches).
+    convolution (including auxiliary branches). Standard parameters are kept as
+    is, while GCBlock internal branches are excluded to preserve personalization.
     """
 
     fused_sd: dict[str, torch.Tensor] = {}
+    gcblock_prefixes = {name for name, module in model.named_modules() if isinstance(module, GCBlock)}
+
+    for key, param in model.state_dict().items():
+        if any(key.startswith(prefix + ".") for prefix in gcblock_prefixes):
+            continue
+        fused_sd[key] = param.detach().clone()
+
     for name, module in model.named_modules():
         if isinstance(module, GCBlock):
-            kernel, bias = module.get_equivalent_kernel_bias()
+            kernel, bias = module.get_equivalent_kernel_bias(
+                lambda_3x3=lambda_3x3, lambda_1x1=lambda_1x1, lambda_id=lambda_id
+            )
             fused_sd[f"{name}.weight"] = kernel.detach().clone()
             fused_sd[f"{name}.bias"] = bias.detach().clone()
     return fused_sd
 
 
 def load_fused_weights_into_gc_model(
-    model: nn.Module, fused_sd: dict, variant: str = "A"
+    model: nn.Module,
+    fused_sd: dict,
+    variant: str = "A",
+    lambda_3x3: float = 1.0,
+    lambda_1x1: float = 1.0,
+    lambda_id: float = 1.0,
 ) -> None:
     """Load fused GCBlock weights back into a training-time model.
 
@@ -310,44 +376,37 @@ def load_fused_weights_into_gc_model(
         variant: "A" zeroes auxiliary branches (1x1 and identity) each round.
             "B" preserves local auxiliary weights while adjusting the main
             3x3 branch so the combined output matches the fused weights.
-
-        "A"：每轮都把 1×1 分支和 identity 分支清零，全局融合权重全部写到 3×3 分支里；
-
-        "B"：保留本地的辅助分支（1×1、identity），只调 3×3 这条主分支，让“三者加起来的等效卷积”刚好等于 fused 权重。
     """
 
     variant = variant.upper()
     if variant not in {"A", "B"}:
         raise ValueError(f"Unsupported variant '{variant}'. Use 'A' or 'B'.")
 
-    for name, module in model.named_modules():  #找到GCBlock部分
+    gcblock_prefixes = {name for name, module in model.named_modules() if isinstance(module, GCBlock)}
+    model_sd = model.state_dict()
+    for name, param in model_sd.items():
+        if name in fused_sd and not any(name.startswith(prefix + ".") for prefix in gcblock_prefixes):
+            param.copy_(fused_sd[name])
+
+    for name, module in model.named_modules():
         if not isinstance(module, GCBlock):
-            continue    #不是GCBlock就跳过
+            continue
 
         weight_key, bias_key = f"{name}.weight", f"{name}.bias"
         if weight_key not in fused_sd or bias_key not in fused_sd:
             raise KeyError(f"Missing fused parameters for GCBlock '{name}' in fused_sd.")
 
-        target_kernel = fused_sd[weight_key]    #取融合后的等效卷积核（3×3 Conv 的权重）
-        target_bias = fused_sd[bias_key]    #取融合后的偏置
+        target_kernel = fused_sd[weight_key]
+        target_bias = fused_sd[bias_key]
 
-        # Deploy-mode blocks can load the fused weights directly.
         if module.deploy:
             module.reparam_conv.weight.data.copy_(target_kernel)
             module.reparam_conv.bias.data.copy_(target_bias)
             continue
 
         if variant == "A":
-            # Zero auxiliary branches so the 3x3 branch carries the fused weights.
-            """
-            核心思想：
-                让 “总输出 = 3×3 分支 + 1×1 分支 + identity 分支 = target 等效卷积”
-                现在我希望：1×1 分支 + identity 分支 = 0，那么 3×3 分支 = target 等效卷积。
-                下次训练时候1*1分支和identity分支从零开始训练
-            """
-            #处理1*1分支，将其置零
+            _zero_out_conv_branch(module.path_3x3_2)
             _zero_out_conv_branch(module.branch_1x1)
-            #处理identity分支
             if isinstance(module.branch_identity, nn.BatchNorm2d):
                 module.branch_identity.weight.data.zero_()
                 module.branch_identity.bias.data.zero_()
@@ -357,36 +416,21 @@ def load_fused_weights_into_gc_model(
                     module.branch_identity.num_batches_tracked.zero_()
             else:
                 module.branch_identity = None
-            #由于其他分支被归零，所以“总效果全靠等效 3×3 分支”，
             residual_kernel = target_kernel
             residual_bias = target_bias
-        else:  # variant "B"
-            """
-            核心思想：
-                先把当前 1×1 + identity 分支的等效卷积算出来（aux_kernel, aux_bias），
-                然后：
-                    3x3_residual = target_kernel - aux_kernel
-                    3x3_bias_residual = target_bias - aux_bias
-                这样“3×3 分支 + 辅助分支 = target 效果”。
-            """
-            aux_kernel, aux_bias = module.get_auxiliary_equivalent_kernel_bias()
+        else:
+            aux_kernel, aux_bias = module.get_auxiliary_equivalent_kernel_bias(
+                lambda_3x3=lambda_3x3, lambda_1x1=lambda_1x1, lambda_id=lambda_id
+            )
             residual_kernel = target_kernel - aux_kernel
             residual_bias = target_bias - aux_bias
 
-        # Write residual into the 3x3 branch with identity BatchNorm.
-        main_conv = module.branch_3x3[0]
+        main_conv = module.path_3x3_1[0]
         main_conv.weight.data.copy_(residual_kernel)
         if main_conv.bias is not None:
             main_conv.bias.data.copy_(residual_bias)
 
-        if module.use_bn and len(module.branch_3x3) > 1:
-            _set_bn_to_identity(module.branch_3x3[1])
+        if module.use_bn and len(module.path_3x3_1) > 1:
+            _set_bn_to_identity(module.path_3x3_1[1])
         else:
-            # If BN is disabled and no conv bias exists, register bias via BN-like tensor.
-            # This path is unlikely but keeps logic consistent.
             main_conv.bias = torch.nn.Parameter(residual_bias.clone())
-
-
-if __name__ == "__main__":
-
-    test_gcblock()

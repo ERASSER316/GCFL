@@ -7,6 +7,8 @@ import numpy as np
 import math
 import torch
 
+from experiments.FLHetero.GCBlock import GCBlock
+
 
 class CNN_1(nn.Module): # large
     def __init__(self, in_channels=3, n_kernels=16, out_dim=10):
@@ -107,7 +109,7 @@ class CNN_1_small(nn.Module): # for hetero. exp.
         return x, homo_rep
 
 
-class CNN_5_small(nn.Module): # change dim of FC            
+class CNN_5_small(nn.Module): # change dim of FC
 
         #虽然说解耦了，但是实际上权重依然是这个模型的权重，权重没有变化，依然可以操作
         #我的初步想法是根据解耦前，解耦后的结构，进行GCBlock的并联结合
@@ -115,20 +117,43 @@ class CNN_5_small(nn.Module): # change dim of FC
         super(CNN_5_small, self).__init__()
 
         self.conv1 = nn.Conv2d(in_channels, n_kernels, 5)
+        self.conv2 = nn.Conv2d(n_kernels, 2 * n_kernels, 5)
         self.pool = nn.MaxPool2d(2, 2)
-        self.conv2 = nn.Conv2d(n_kernels, 2* n_kernels, 5)
-        self.fc1 = nn.Linear(2* n_kernels * 5 * 5, 500)
+
+        self.gcblock1 = GCBlock(
+            in_channels=in_channels,
+            out_channels=n_kernels,
+            kernel_size=5,
+            padding=0,
+            use_second_3x3=True,
+            use_identity=False,
+        )
+        self.gcblock2 = GCBlock(
+            in_channels=n_kernels,
+            out_channels=2 * n_kernels,
+            kernel_size=5,
+            padding=0,
+            use_second_3x3=True,
+            use_identity=False,
+        )
+
+        self.fc1 = nn.Linear(2 * n_kernels * 5 * 5, 500)
         self.fc2 = nn.Linear(500, small_rep_dim)
         self.fc3 = nn.Linear(small_rep_dim, out_dim)
 
     def forward(self, x, m_rep_small):
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = x.view(x.shape[0], -1)
-        x = F.relu(self.fc1(x))
-        homo_rep = F.relu(self.fc2(x))
-        x = self.fc3(m_rep_small)
-        return x, homo_rep
+        main = self.pool(F.relu(self.conv1(x)))
+        main = self.pool(F.relu(self.conv2(main)))
+
+        gc = self.pool(self.gcblock1(x))
+        gc = self.pool(self.gcblock2(gc))
+
+        fused = main + gc
+        fused = fused.view(fused.shape[0], -1)
+        fused = F.relu(self.fc1(fused))
+        homo_rep = F.relu(self.fc2(fused))
+        out = self.fc3(m_rep_small)
+        return out, homo_rep
 
 class projector(nn.Module):
     def __init__(self, in_dim=750, out_dim=500):    #1000*500=500000 ，那我如果优化这个映射机制呢？

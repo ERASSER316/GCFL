@@ -4,6 +4,7 @@ useless/
 Results/
 data/
 README.md
+!experiments/FLHetero/README.md
 myCNNs.py
 experiments/FLHetero/Models/myCNNs.py
 experiments/FLHetero/FedMRL_myCNN.py

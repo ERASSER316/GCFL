@@ -16,6 +16,7 @@ import torch.nn.functional as F
 import sys
 
 
+from experiments.FLHetero.GCBlock import build_fused_state_dict, load_fused_weights_into_gc_model
 from experiments.FLHetero.Models.CNNs import CNN_1_large,CNN_2_large,CNN_3_large,CNN_4_large,CNN_5_large,CNN_5_small,projector
 from experiments.FLHetero.node import BaseNodes
 from experiments.utils import get_device, set_logger, set_seed, str2bool
@@ -149,7 +150,7 @@ def train(data_name: str, data_path: str, classes_per_node: int, num_nodes: int,
           steps: int, epochs: int, optim: str, lr: float, inner_lr: float,
           embed_lr: float, wd: float, inner_wd: float, embed_dim: int, hyper_hid: int,
           n_hidden: int, n_kernels: int, bs: int, device, eval_every: int, save_path: Path,
-          seed: int,LowProb) -> None:
+          seed: int,LowProb, lambda_3x3: float, lambda_1x1: float, lambda_id: float, gc_variant: str) -> None:
 
     ###############################
     # init nodes, hnet, local net #
@@ -236,8 +237,6 @@ def train(data_name: str, data_path: str, classes_per_node: int, num_nodes: int,
     ################
     step_iter = trange(steps)
 
-    GM_small = copy.deepcopy(net_small.state_dict())        #将共享的小模型初始化为全局模型
-
     PM_large_acc = defaultdict()
     PM_small = defaultdict()
     PM_large = defaultdict()
@@ -246,7 +245,7 @@ def train(data_name: str, data_path: str, classes_per_node: int, num_nodes: int,
 
     for i in range(num_nodes):  #为每个客户端初始化共享小模型、各自的本地训练大模型、各自的本地的投影模型
         PM_large_acc[i] = 0
-        PM_small[i] = GM_small
+        PM_small[i] = copy.deepcopy(net_small.state_dict())
         PM_large[i] = copy.deepcopy(net_set[i%5].state_dict())
         #ALPHA[i] = 1.0
         PM_proj[i] = copy.deepcopy(net_proj.state_dict())
@@ -282,7 +281,7 @@ def train(data_name: str, data_path: str, classes_per_node: int, num_nodes: int,
             for c in select_nodes:
                 node_id = c
 
-                net_small.load_state_dict(GM_small)
+                net_small.load_state_dict(PM_small[node_id])
                 net_large = net_set[node_id % 5]
                 net_large.load_state_dict(PM_large[node_id])
                 optimizer_large = torch.optim.SGD(params=net_large.parameters(), lr=lr, momentum=0.9, weight_decay=wd)
@@ -350,7 +349,13 @@ def train(data_name: str, data_path: str, classes_per_node: int, num_nodes: int,
 
                 # collect local NN parameters
                 #更新本次客户端小模型的权重
-                LNs[node_id] = net_small.state_dict()
+                LNs[node_id] = build_fused_state_dict(
+                    net_small,
+                    lambda_3x3=lambda_3x3,
+                    lambda_1x1=lambda_1x1,
+                    lambda_id=lambda_id,
+                )
+                PM_small[node_id] = copy.deepcopy(net_small.state_dict())
 
                 # evaluate trained local model
                 trained_loss_small, trained_acc_small = test_acc_small(net_large, net_small, net_proj, nodes.test_loaders[node_id], criteria,small_rep_dim)
@@ -408,13 +413,29 @@ def train(data_name: str, data_path: str, classes_per_node: int, num_nodes: int,
                 client_agg_weights[select_nodes[i]] = select_nodes_sample_count[select_nodes[i]] / sum(select_nodes_sample_count.values())
 
 
-            weight_keys = list(net_small.state_dict().keys())
-            #加权聚合小模型的权重
+            if len(LNs) > 0:
+                weight_keys = list(next(iter(LNs.values())).keys())
+            else:
+                weight_keys = []
+
+            global_fused = OrderedDict()
             for key in weight_keys:
                 key_sum = 0
                 for id, model in LNs.items():
                     key_sum += client_agg_weights[id] * model[key]
-                GM_small[key] = key_sum     #更新全局共享小模型的权重
+                global_fused[key] = key_sum
+
+            for client_id in PM_small.keys():
+                net_small.load_state_dict(PM_small[client_id])
+                load_fused_weights_into_gc_model(
+                    net_small,
+                    global_fused,
+                    variant=gc_variant,
+                    lambda_3x3=lambda_3x3,
+                    lambda_1x1=lambda_1x1,
+                    lambda_id=lambda_id,
+                )
+                PM_small[client_id] = copy.deepcopy(net_small.state_dict())
             logging.info(f'Global model is updated after aggregation')
 
         logging.info('Federated Learning has been successfully!')
@@ -462,6 +483,11 @@ if __name__ == '__main__':
     parser.add_argument("--hyper-hid", type=int, default=100, help="hypernet hidden dim")
     parser.add_argument("--spec-norm", type=str2bool, default=False, help="hypernet hidden dim")
     parser.add_argument("--nkernels", type=int, default=16, help="number of kernels for cnn model")
+
+    parser.add_argument("--lambda-3x3", type=float, default=1.0, help="Fusion weight for 3x3 branches")
+    parser.add_argument("--lambda-1x1", type=float, default=1.0, help="Fusion weight for 1x1 branches")
+    parser.add_argument("--lambda-id", type=float, default=1.0, help="Fusion weight for identity branch")
+    parser.add_argument("--gc-variant", type=str, default="B", choices=["A", "B"], help="GCBlock aggregation variant")
 
     #############################
     #       General args        #
@@ -511,6 +537,10 @@ if __name__ == '__main__':
         eval_every=args.eval_every,
         save_path=args.save_path,
         seed=args.seed,
-        LowProb=args.LowProb
+        LowProb=args.LowProb,
+        lambda_3x3=args.lambda_3x3,
+        lambda_1x1=args.lambda_1x1,
+        lambda_id=args.lambda_id,
+        gc_variant=args.gc_variant,
 
     )
