@@ -1,458 +1,392 @@
+from typing import Optional, Tuple
+
+from typing import Optional, Tuple
+
 import torch
-import torch.nn as nn
-import numpy as np
-from mmengine.model import BaseModule
-from torch import Tensor
-from typing import Optional, Tuple, Union
-from mmseg.utils import OptConfigType
-from mmcv.cnn import ConvModule, build_norm_layer, build_activation_layer
-
-
-class Block1x1(BaseModule):
-    """
-    GCBlock的1×1-1×1分支模块（训练时双1×1卷积+BN，推理时融合为单1×1卷积）
-    功能：通过双1×1卷积实现通道维度变换，同时支持训练/推理模式切换（重参数化）
-    """
-    
-    def __init__(self,
-                in_channels: int,
-                out_channels: int,
-                stride: Union[int, Tuple[int]] = 1,
-                padding: Union[int, Tuple[int]] = 0,
-                bias: bool = True,
-                norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-                deploy: bool = False):
-        """
-        Args:
-            in_channels: 输入通道数
-            out_channels: 输出通道数
-            stride: 卷积步长（默认1，1×1卷积步长不影响空间尺寸）
-            padding: 卷积填充（默认0，1×1卷积无需填充）
-            bias: 是否使用偏置（训练时False，推理时True，因BN已融合偏置）
-            norm_cfg: 归一化层配置（默认BN，训练时生效）
-            deploy: 是否为推理模式（True=单1×1卷积，False=双1×1卷积+BN）
-        """
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.stride = stride
-        self.padding = padding
-        self.bias = bias
-        self.deploy = deploy
-        
-        # 推理模式：直接使用单1×1卷积（已融合训练时双分支参数）
-        if self.deploy:
-            self.conv = nn.Conv2d(
-                in_channels, out_channels, kernel_size=1,
-                stride=stride, padding=padding, bias=True
-            )
-        # 训练模式：双1×1卷积+BN（ConvModule=Conv2d+BN+激活，此处act_cfg=None无激活）
-        else:
-            self.conv1 = ConvModule(
-                in_channels=in_channels, out_channels=out_channels, kernel_size=1,
-                stride=stride, padding=padding, bias=bias, norm_cfg=norm_cfg, act_cfg=None
-            )
-            self.conv2 = ConvModule(
-                in_channels=out_channels, out_channels=out_channels, kernel_size=1,
-                stride=1, padding=padding, bias=bias, norm_cfg=norm_cfg, act_cfg=None
-            )
-    
-    def forward(self, x):
-        """前向传播：推理时单卷积，训练时双卷积串联"""
-        if self.deploy:
-            return self.conv(x)
-        else:
-            x = self.conv1(x)
-            x = self.conv2(x)
-            return x
-    
-    def _fuse_bn_tensor(self, conv: ConvModule):
-        """
-        融合ConvModule中的卷积层与BN层（核心重参数化操作）
-        公式：融合后权重 = 卷积权重 * (BN_gamma / sqrt(BN_var+eps))
-             融合后偏置 = BN_beta + (卷积偏置 - BN_mean) * BN_gamma / sqrt(BN_var+eps)
-        """
-        # 提取卷积层与BN层参数
-        kernel = conv.conv.weight  # 卷积权重 (out, in, 1, 1)
-        bias = conv.conv.bias if conv.conv.bias is not None else 0  # 卷积偏置
-        running_mean = conv.bn.running_mean  # BN移动均值
-        running_var = conv.bn.running_var    # BN移动方差
-        gamma = conv.bn.weight               # BN缩放系数
-        beta = conv.bn.bias                  # BN偏置
-        eps = conv.bn.eps                    # BN防止除零的小值
-        
-        # 计算融合参数
-        std = (running_var + eps).sqrt()
-        t = (gamma / std).reshape(-1, 1, 1, 1)  # 适配卷积权重维度的缩放因子
-        fused_kernel = kernel * t
-        fused_bias = beta + (bias - running_mean) * gamma / std if self.bias else beta - running_mean * gamma / std
-        return fused_kernel, fused_bias
-    
-    def switch_to_deploy(self):
-        """
-        训练模式切换为推理模式：
-        1. 融合conv1与conv2的卷积+BN参数
-        2. 计算双1×1卷积串联的等效单1×1卷积参数
-        3. 替换为单卷积层，删除训练时分支
-        """
-        # 融合conv1与conv2的参数
-        kernel1, bias1 = self._fuse_bn_tensor(self.conv1)
-        kernel2, bias2 = self._fuse_bn_tensor(self.conv2)
-        
-        # 计算双1×1卷积串联的等效权重（矩阵乘法）与偏置（累加+加权）
-        # kernel2 (O, M, 1,1) * kernel1 (M, I, 1,1) = 等效权重 (O, I, 1,1)
-        fused_kernel = torch.einsum('oi,icjk->ocjk', kernel2.squeeze(3).squeeze(2), kernel1)
-        # 等效偏置 = bias2 + sum(bias1 * kernel2的通道权重)
-        fused_bias = bias2 + (bias1.view(1, -1, 1, 1) * kernel2).sum(3).sum(2).sum(1)
-        
-        # 构建推理用单卷积层
-        self.conv = nn.Conv2d(
-            self.in_channels, self.out_channels, kernel_size=1,
-            stride=self.stride, padding=self.padding, bias=True
-        )
-        self.conv.weight.data = fused_kernel
-        self.conv.bias.data = fused_bias
-        
-        # 删除训练时的双分支
-        self.__delattr__('conv1')
-        self.__delattr__('conv2')
-        self.deploy = True
-
-
-class Block3x3(BaseModule):
-    """
-    GCBlock的3×3-1×1分支模块（训练时3×3卷积+1×1卷积+BN，推理时融合为单3×3卷积）
-    功能：捕捉局部空间特征（3×3）+ 通道维度压缩（1×1），支持重参数化
-    """
-    
-    def __init__(self,
-                in_channels: int,
-                out_channels: int,
-                stride: Union[int, Tuple[int]] = 1,
-                padding: Union[int, Tuple[int]] = 0,
-                bias: bool = True,
-                norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-                deploy: bool = False):
-        """
-        Args:
-            padding: 3×3卷积的填充（默认0，训练时需外部适配same padding）
-            其他参数同Block1x1
-        """
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.stride = stride
-        self.padding = padding
-        self.bias = bias
-        self.deploy = deploy
-        
-        # 推理模式：单3×3卷积（融合3×3+1×1参数）
-        if self.deploy:
-            self.conv = nn.Conv2d(
-                in_channels, out_channels, kernel_size=3,
-                stride=stride, padding=padding, bias=True
-            )
-        # 训练模式：3×3卷积（抓空间）+ 1×1卷积（压通道）+ BN
-        else:
-            self.conv1 = ConvModule(
-                in_channels=in_channels, out_channels=out_channels, kernel_size=3,
-                stride=stride, padding=padding, bias=bias, norm_cfg=norm_cfg, act_cfg=None
-            )
-            self.conv2 = ConvModule(
-                in_channels=out_channels, out_channels=out_channels, kernel_size=1,
-                stride=1, padding=0, bias=bias, norm_cfg=norm_cfg, act_cfg=None
-            )
-    
-    def forward(self, x):
-        """前向传播：推理时单3×3卷积，训练时3×3→1×1串联"""
-        if self.deploy:
-            return self.conv(x)
-        else:
-            x = self.conv1(x)
-            x = self.conv2(x)
-            return x
-    
-    def _fuse_bn_tensor(self, conv: ConvModule):
-        """同Block1x1，融合卷积与BN参数（适配3×3卷积权重维度）"""
-        kernel = conv.conv.weight  # (out, in, 3, 3)
-        bias = conv.conv.bias if conv.conv.bias is not None else 0
-        running_mean = conv.bn.running_mean
-        running_var = conv.bn.running_var
-        gamma = conv.bn.weight
-        beta = conv.bn.bias
-        eps = conv.bn.eps
-        
-        std = (running_var + eps).sqrt()
-        t = (gamma / std).reshape(-1, 1, 1, 1)
-        fused_kernel = kernel * t
-        fused_bias = beta + (bias - running_mean) * gamma / std if self.bias else beta - running_mean * gamma / std
-        return fused_kernel, fused_bias
-    
-    def switch_to_deploy(self):
-        """
-        训练→推理模式切换：
-        融合3×3+1×1卷积的参数，生成等效单3×3卷积
-        """
-        kernel1, bias1 = self._fuse_bn_tensor(self.conv1)  # 3×3卷积融合参数
-        kernel2, bias2 = self._fuse_bn_tensor(self.conv2)  # 1×1卷积融合参数
-        
-        # 计算3×3→1×1串联的等效权重（1×1卷积权重适配3×3维度后与3×3权重矩阵乘法）
-        # kernel2 (O, M, 1,1) → 展平为(O,M)，kernel1 (M, I, 3,3) → 等效为(O, I, 3,3)
-        fused_kernel = torch.einsum('oi,icjk->ocjk', kernel2.squeeze(3).squeeze(2), kernel1)
-        # 等效偏置 = bias2 + sum(bias1 * kernel2的通道权重)
-        fused_bias = bias2 + (bias1.view(1, -1, 1, 1) * kernel2).sum(3).sum(2).sum(1)
-        
-        # 构建推理用单3×3卷积
-        self.conv = nn.Conv2d(
-            self.in_channels, self.out_channels, kernel_size=3,
-            stride=self.stride, padding=self.padding, bias=True
-        )
-        self.conv.weight.data = fused_kernel
-        self.conv.bias.data = fused_bias
-        
-        # 删除训练分支
-        self.__delattr__('conv1')
-        self.__delattr__('conv2')
-        self.deploy = True
+from torch import nn
 
 
 class GCBlock(nn.Module):
+    """Grouped convolution-style block with re-parameterization support.
+
+    This block follows a multi-branch design during training and is fused
+    into a single :class:`~torch.nn.Conv2d` layer for deployment. The main
+    branch uses a 3x3 convolution. Optional 1x1 and identity branches can be
+    enabled via the constructor. BatchNorm layers are fused into the
+    resulting convolution when ``switch_to_deploy`` is called.
     """
-    核心模块：Group Convolution Block（GCBlock）
-    设计思想：训练时多分支并行（2个3×3-1×1分支+1个1×1-1×1分支+残差分支），
-    推理时重参数化为单3×3卷积，平衡训练表达能力与推理效率
-    """
-    
-    def __init__(self,
-                in_channels: int,
-                out_channels: int,
-                kernel_size: Union[int, Tuple[int]] = 3,
-                stride: Union[int, Tuple[int]] = 1,
-                padding: Union[int, Tuple[int]] = 1,
-                padding_mode: Optional[str] = 'zeros',
-                norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-                act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
-                act: bool = True,
-                deploy: bool = False):
-        """
-        Args:
-            kernel_size: 卷积核大小（强制为3，因模块设计基于3×3卷积）
-            padding: 3×3卷积的same padding（强制为1，确保输入输出尺寸一致）
-            act: 是否使用激活函数（默认True，输出前ReLU）
-            其他参数同Block1x1/Block3x3
-        """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: int = 1,
+        padding: int = 1,
+        use_identity: bool = True,
+        use_1x1: bool = True,
+        use_bn: bool = True,
+        deploy: bool = False,
+    ) -> None:
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.kernel_size = kernel_size
         self.stride = stride
         self.padding = padding
+        self.use_identity = use_identity
+        self.use_1x1 = use_1x1
+        self.use_bn = use_bn
         self.deploy = deploy
-        
-        # 强制校验：GCBlock仅支持3×3 kernel与1 padding（确保same padding和模块设计一致性）
-        assert kernel_size == 3, "GCBlock only supports kernel_size=3"
-        assert padding == 1, "GCBlock only supports padding=1 for same output size"
-        
-        padding_11 = padding - kernel_size // 2  # 1×1分支的padding（3//2=1，故padding_11=0）
-        
-        # 激活函数（默认ReLU，无激活时用恒等映射）
-        self.relu = build_activation_layer(act_cfg) if act else nn.Identity()
-        
-        # 推理模式：单3×3卷积（融合所有训练分支参数）
+
         if deploy:
-            self.reparam_3x3 = nn.Conv2d(
-                in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size,
-                stride=stride, padding=padding, bias=True, padding_mode=padding_mode
+            self.reparam_conv = nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=3,
+                stride=stride,
+                padding=padding,
+                bias=True,
             )
-        # 训练模式：4个并行分支（2×3×3-1×1 + 1×1×1-1×1 + 残差）
         else:
-            # 残差分支：仅当输入输出通道一致且步长为1时存在（BN层，无卷积，保留原始特征）
-            if (out_channels == in_channels) and (stride == 1):
-                self.path_residual = build_norm_layer(norm_cfg, num_features=in_channels)[1]
+            self.branch_3x3 = self._conv_bn(
+                in_channels,
+                out_channels,
+                kernel_size=3,
+                stride=stride,
+                padding=padding,
+            )
+
+            self.branch_1x1: Optional[nn.Sequential]
+            if use_1x1:
+                self.branch_1x1 = self._conv_bn(
+                    in_channels,
+                    out_channels,
+                    kernel_size=1,
+                    stride=stride,
+                    padding=0,
+                )
             else:
-                self.path_residual = None  # 通道/步长不匹配时无残差
-            
-            # 分支1：3×3-1×1（抓局部空间特征1）
-            self.path_3x3_1 = Block3x3(
-                in_channels=in_channels, out_channels=out_channels,
-                stride=stride, padding=padding, bias=False, norm_cfg=norm_cfg
+                self.branch_1x1 = None
+
+            self.branch_identity: Optional[nn.BatchNorm2d]
+            if use_identity and out_channels == in_channels and stride == 1:
+                self.branch_identity = (
+                    nn.BatchNorm2d(in_channels) if use_bn else nn.Identity()
+                )
+            else:
+                self.branch_identity = None
+
+        self.activation = nn.ReLU(inplace=True)
+
+    def _conv_bn(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int,
+        padding: int,
+    ) -> nn.Sequential:
+        layers = [
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                bias=not self.use_bn,
             )
-            # 分支2：3×3-1×1（抓局部空间特征2，与分支1参数独立，增强表达）
-            self.path_3x3_2 = Block3x3(
-                in_channels=in_channels, out_channels=out_channels,
-                stride=stride, padding=padding, bias=False, norm_cfg=norm_cfg
-            )
-            # 分支3：1×1-1×1（抓通道维度特征，补充空间分支的不足）
-            self.path_1x1 = Block1x1(
-                in_channels=in_channels, out_channels=out_channels,
-                stride=stride, padding=padding_11, bias=False, norm_cfg=norm_cfg
-            )
-    
-    def forward(self, inputs: Tensor) -> Tensor:
-        """
-        前向传播：
-        - 推理时：单3×3卷积 → 激活
-        - 训练时：4分支求和 → 激活
-        """
-        # 推理模式
-        if hasattr(self, 'reparam_3x3'):
-            return self.relu(self.reparam_3x3(inputs))
-        
-        # 训练模式：计算各分支输出
-        # 残差分支：有则用BN处理输入，无则输出0
-        id_out = self.path_residual(inputs) if self.path_residual is not None else 0
-        # 3个卷积分支输出求和 + 残差分支
-        total_out = self.path_3x3_1(inputs) + self.path_3x3_2(inputs) + self.path_1x1(inputs) + id_out
-        # 激活后输出
-        return self.relu(total_out)
-    
-    def get_equivalent_kernel_bias(self):
-        """
-        计算所有训练分支的等效权重与偏置（重参数化核心）
-        步骤：
-        1. 所有子分支切换到推理模式，获取融合后的参数
-        2. 1×1分支权重填充为3×3维度（便于与其他分支求和）
-        3. 残差分支转换为等效3×3恒等卷积参数
-        4. 所有分支参数求和，得到单3×3卷积的等效参数
-        """
-        # 1. 3×3-1×1分支1：获取融合后的3×3参数
-        self.path_3x3_1.switch_to_deploy()
-        kernel3x3_1, bias3x3_1 = self.path_3x3_1.conv.weight.data, self.path_3x3_1.conv.bias.data
-        
-        # 2. 3×3-1×1分支2：同上
-        self.path_3x3_2.switch_to_deploy()
-        kernel3x3_2, bias3x3_2 = self.path_3x3_2.conv.weight.data, self.path_3x3_2.conv.bias.data
-        
-        # 3. 1×1-1×1分支：获取融合后的1×1参数，填充为3×3
-        self.path_1x1.switch_to_deploy()
-        kernel1x1, bias1x1 = self.path_1x1.conv.weight.data, self.path_1x1.conv.bias.data
-        kernel1x1_padded = self._pad_1x1_to_3x3_tensor(kernel1x1)
-        
-        # 4. 残差分支：转换为等效3×3恒等卷积参数
-        kernelid, biasid = self._fuse_bn_tensor(self.path_residual)
-        
-        # 所有分支参数求和（权重+偏置）
-        equivalent_kernel = kernel3x3_1 + kernel3x3_2 + kernel1x1_padded + kernelid
-        equivalent_bias = bias3x3_1 + bias3x3_2 + bias1x1 + biasid
-        
-        return equivalent_kernel, equivalent_bias
-    
-    def _pad_1x1_to_3x3_tensor(self, kernel1x1):
-        """将1×1卷积权重填充为3×3维度（上下左右各补1个0，中心保留原权重）"""
-        if kernel1x1 is None:
-            return 0
+        ]
+        if self.use_bn:
+            layers.append(nn.BatchNorm2d(out_channels))
+        return nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.deploy:
+            return self.activation(self.reparam_conv(x))
+
+        out = self.branch_3x3(x)
+        if self.branch_1x1 is not None:
+            out = out + self.branch_1x1(x)
+        if self.branch_identity is not None:
+            out = out + self.branch_identity(x)
+        return self.activation(out)
+
+    def get_equivalent_kernel_bias(self) -> tuple[torch.Tensor, torch.Tensor]:
+        kernel3x3, bias3x3 = self._fuse_conv_bn(self.branch_3x3)
+
+        kernel1x1 = bias1x1 = None
+        if self.branch_1x1 is not None:
+            kernel1x1, bias1x1 = self._fuse_conv_bn(self.branch_1x1)
+            kernel1x1 = self._pad_1x1_to_3x3(kernel1x1)
         else:
-            # padding格式：[左,右,上,下]，填充后尺寸从( O,I,1,1 )→( O,I,3,3 )
-            return torch.nn.functional.pad(kernel1x1, [1, 1, 1, 1])
-    
-    def _fuse_bn_tensor(self, conv: Union[nn.BatchNorm2d, None]):
+            kernel1x1 = torch.zeros_like(kernel3x3)
+            bias1x1 = torch.zeros_like(bias3x3)
+
+        kernelid, biasid = self._fuse_identity()
+
+        kernel = kernel3x3 + kernel1x1 + kernelid
+        bias = bias3x3 + bias1x1 + biasid
+        return kernel, bias
+
+    def get_auxiliary_equivalent_kernel_bias(
+        self,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the combined contribution of the auxiliary branches.
+
+        This helper is used when loading fused weights back into training-time
+        models while keeping the local auxiliary branches intact (variant B).
         """
-        将残差分支的BN层转换为等效3×3恒等卷积参数
-        原理：BN层对输入x的操作 → x*gamma/sqrt(var+eps) + (beta - mean*gamma/sqrt(var+eps))
-        等效为恒等卷积（中心权重1，其余0）与BN参数融合后的3×3卷积
-        """
-        if conv is None:
-            return 0, 0  # 无残差分支时返回0
-        
-        # 若为ConvModule（扩展场景），提取对应参数
-        if isinstance(conv, ConvModule):
-            kernel = conv.conv.weight
-            running_mean = conv.bn.running_mean
-            running_var = conv.bn.running_var
-            gamma = conv.bn.weight
-            beta = conv.bn.bias
-            eps = conv.bn.eps
-        # 若为BN层（残差分支默认场景），构造恒等卷积权重
+
+        if self.branch_1x1 is None:
+            kernel1x1 = torch.zeros_like(self.branch_3x3[0].weight)
+            bias1x1 = torch.zeros_like(self.branch_3x3[0].weight[:, 0, 0, 0])
         else:
-            assert isinstance(conv,
-                            (nn.SyncBatchNorm, nn.BatchNorm2d)), "Only BN layers are supported for residual path"
-            # 构造恒等卷积权重：(out, in, 3, 3)，仅中心位置为1（其他为0）
-            if not hasattr(self, 'id_tensor'):
-                kernel_value = np.zeros((self.out_channels, self.in_channels, 3, 3), dtype=np.float32)
-                for i in range(self.out_channels):
-                    kernel_value[i, i % self.in_channels, 1, 1] = 1  # 中心位置权重=1
-                self.id_tensor = torch.from_numpy(kernel_value).to(conv.weight.device)
-            kernel = self.id_tensor
-            running_mean = conv.running_mean
-            running_var = conv.running_var
-            gamma = conv.weight
-            beta = conv.bias
-            eps = conv.eps
-        
-        # 融合BN参数到恒等卷积权重与偏置
-        std = (running_var + eps).sqrt()
-        t = (gamma / std).reshape(-1, 1, 1, 1)
-        fused_kernel = kernel * t
-        fused_bias = beta - running_mean * gamma / std  # 残差分支无卷积偏置，故简化公式
-        
-        return fused_kernel, fused_bias
-    
-    def switch_to_deploy(self):
+            kernel1x1, bias1x1 = self._fuse_conv_bn(self.branch_1x1)
+            kernel1x1 = self._pad_1x1_to_3x3(kernel1x1)
+
+        kernelid, biasid = self._fuse_identity()
+        kernel = kernel1x1 + kernelid
+        bias = bias1x1 + biasid
+        return kernel, bias
+
+    def _fuse_conv_bn(
+        self, branch: nn.Sequential
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        conv = branch[0]
+        bn = branch[1] if self.use_bn and len(branch) > 1 else None
+
+        if bn is None:
+            weight = conv.weight
+            bias = conv.bias if conv.bias is not None else torch.zeros_like(weight[:, 0, 0, 0])
+            return weight, bias
+
+        std = torch.sqrt(bn.running_var + bn.eps)
+        t = (bn.weight / std).reshape(-1, 1, 1, 1)
+        fused_weight = conv.weight * t
+        fused_bias = bn.bias - bn.running_mean * bn.weight / std
+        if conv.bias is not None:
+            fused_bias += conv.bias * bn.weight / std
+        return fused_weight, fused_bias
+
+    def _fuse_identity(self) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        训练模式切换为推理模式：
-        1. 计算所有分支的等效参数
-        2. 构建单3×3卷积层，赋值等效参数
-        3. 删除训练时的所有分支，释放内存
+        情况一：
+            如果use_identity=None说明或者通道数不匹配导致无法建立恒等映射，这个分支就不存在
+            既然不存在，它对结果的贡献就是0，即融合的时候返回一个全0的卷积核和全0的偏置
         """
-        if hasattr(self, 'reparam_3x3'):
-            return  # 已为推理模式，无需重复操作
-        
-        # 获取等效参数
-        kernel, bias = self.get_equivalent_kernel_bias()
-        
-        # 构建推理用单3×3卷积
-        self.reparam_3x3 = nn.Conv2d(
-            in_channels=self.in_channels, out_channels=self.out_channels,
-            kernel_size=self.kernel_size, stride=self.stride,
-            padding=self.padding, bias=True
+
+        if self.branch_identity is None:
+            kernel_value = torch.zeros(
+                (self.out_channels, self.in_channels, 3, 3), device=self.branch_3x3[0].weight.device
+            )
+            bias_value = torch.zeros(self.out_channels, device=kernel_value.device)
+            return kernel_value, bias_value
+        """
+        情况二：
+            没有BN的纯恒等映射，为了保证输出原样图像，卷积核中心为1，周围为0即可（狄拉克函数形式的卷积核）
+            bias置零
+        """
+        if isinstance(self.branch_identity, nn.Identity):
+            identity_kernel = torch.zeros(
+                (self.out_channels, self.in_channels, 3, 3), device=self.branch_3x3[0].weight.device
+            )
+            for i in range(self.out_channels):
+                identity_kernel[i, i % self.in_channels, 1, 1] = 1
+            bias = torch.zeros(self.out_channels, device=identity_kernel.device)
+            return identity_kernel, bias
+        """
+        情况三：带BN的恒等映射
+            首先构造基础的恒等卷积核，与情况一完全相同
+            然后考虑这个BN参数的提取
+            最终融合进新的卷积核即可
+        """
+        # BatchNorm identity branch
+        input_dim = self.in_channels
+        id_kernel_value = torch.zeros(
+            (self.out_channels, input_dim, 3, 3), device=self.branch_3x3[0].weight.device
         )
-        self.reparam_3x3.weight.data = kernel
-        self.reparam_3x3.bias.data = bias
-        
-        # 冻结参数（推理时无需梯度）
-        for para in self.parameters():
-            para.detach_()
-        
-        # 删除训练时的分支与临时变量
-        self.__delattr__('path_3x3_1')
-        self.__delattr__('path_3x3_2')
-        self.__delattr__('path_1x1')
-        if hasattr(self, 'path_residual'):
-            self.__delattr__('path_residual')
-        if hasattr(self, 'id_tensor'):
-            self.__delattr__('id_tensor')
-        
+        for i in range(self.out_channels):
+            id_kernel_value[i, i % input_dim, 1, 1] = 1
+
+        running_mean = self.branch_identity.running_mean
+        running_var = self.branch_identity.running_var
+        gamma = self.branch_identity.weight
+        beta = self.branch_identity.bias
+        eps = self.branch_identity.eps
+        std = torch.sqrt(running_var + eps)
+        t = (gamma / std).reshape(-1, 1, 1, 1)
+        fused_kernel = id_kernel_value * t
+        fused_bias = beta - running_mean * gamma / std
+        return fused_kernel, fused_bias
+
+    @staticmethod
+    def _pad_1x1_to_3x3(kernel: torch.Tensor) -> torch.Tensor:
+        if kernel.size(2) == 1:
+            return nn.functional.pad(kernel, [1, 1, 1, 1])
+        return kernel
+
+    def switch_to_deploy(self) -> None:
+        if self.deploy:
+            return
+        kernel, bias = self.get_equivalent_kernel_bias()
+        self.reparam_conv = nn.Conv2d(
+            self.in_channels,
+            self.out_channels,
+            kernel_size=3,
+            stride=self.stride,
+            padding=self.padding,
+            bias=True,
+        )
+        self.reparam_conv.weight.data = kernel
+        self.reparam_conv.bias.data = bias
+
+        # Clean training-time branches
+        del self.branch_3x3
+        if self.branch_1x1 is not None:
+            del self.branch_1x1
+        if self.branch_identity is not None:
+            del self.branch_identity
         self.deploy = True
 
 
-def test_gcblock():
-    """测试GCBlock的基本功能"""
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    x = torch.randn(1, 64, 32, 32).to(device)
-    
-    # 创建GCBlock实例
-    model = GCBlock(64, 64)
-    model.to(device)
-    
-    # 训练模式前向传播
-    y_train = model(x)
-    print("训练模式测试:")
-    print("输入特征维度：", x.shape)
-    print("输出特征维度：", y_train.shape)
-    
-    # 切换到推理模式
-    model.switch_to_deploy()   
-    y_deploy = model(x)
-    print("\n推理模式测试:")
-    print("输出特征维度：", y_deploy.shape)
-    
-    # 检查输出是否一致（允许微小误差）
-    diff = torch.abs(y_train - y_deploy).max().item()
-    print(f"\n训练与推理模式输出最大差异: {diff:.6f}")
-    
-    print("\n微信公众号：十小大的底层视觉工坊")
-    print("知乎、CSDN：十小大")
+def _set_bn_to_identity(bn: nn.BatchNorm2d) -> None:
+    """Reset a :class:`BatchNorm2d` layer to behave like an identity mapping."""
+
+    bn.weight.data.fill_(1.0)
+    bn.bias.data.zero_()
+    bn.running_mean.zero_()
+    bn.running_var.fill_(1.0)
+    if hasattr(bn, "num_batches_tracked"):
+        bn.num_batches_tracked.zero_()
+
+
+def _zero_out_conv_branch(branch: Optional[nn.Sequential]) -> None:
+    """
+    Zero out a convolutional branch without changing its structure.
+    将目标卷积层weight和bias置零
+    服务于A思路的权重融合匹配
+    """
+
+    if branch is None:
+        return
+    conv = branch[0]
+    conv.weight.data.zero_()
+    if conv.bias is not None:
+        conv.bias.data.zero_()
+    if len(branch) > 1 and isinstance(branch[1], nn.BatchNorm2d):
+        branch[1].weight.data.zero_()
+        branch[1].bias.data.zero_()
+        branch[1].running_mean.zero_()
+        branch[1].running_var.fill_(1.0)
+        if hasattr(branch[1], "num_batches_tracked"):
+            branch[1].num_batches_tracked.zero_()
+
+
+def build_fused_state_dict(model: nn.Module) -> dict:   #找到模型中GCBlock的部分，进行重参数化后，将等效的权重返回，修剪权重的关键
+    """Return a deterministic mapping of fused GCBlock parameters.
+
+    The returned dictionary maps ``"<module_name>.weight"`` and
+    ``"<module_name>.bias"`` keys to tensors representing the fully fused
+    3x3 convolution (including 1x1 and identity branches).
+    """
+
+    fused_sd: dict[str, torch.Tensor] = {}
+    for name, module in model.named_modules():
+        if isinstance(module, GCBlock):
+            kernel, bias = module.get_equivalent_kernel_bias()
+            fused_sd[f"{name}.weight"] = kernel.detach().clone()
+            fused_sd[f"{name}.bias"] = bias.detach().clone()
+    return fused_sd
+
+
+def load_fused_weights_into_gc_model(
+    model: nn.Module, fused_sd: dict, variant: str = "A"
+) -> None:
+    """Load fused GCBlock weights back into a training-time model.
+
+    Args:
+        model: Model containing :class:`GCBlock` instances.
+        fused_sd: Fused state dictionary produced by
+            :func:`build_fused_state_dict`.
+        variant: "A" zeroes auxiliary branches (1x1 and identity) each round.
+            "B" preserves local auxiliary weights while adjusting the main
+            3x3 branch so the combined output matches the fused weights.
+
+        "A"：每轮都把 1×1 分支和 identity 分支清零，全局融合权重全部写到 3×3 分支里；
+
+        "B"：保留本地的辅助分支（1×1、identity），只调 3×3 这条主分支，让“三者加起来的等效卷积”刚好等于 fused 权重。
+    """
+
+    variant = variant.upper()
+    if variant not in {"A", "B"}:
+        raise ValueError(f"Unsupported variant '{variant}'. Use 'A' or 'B'.")
+
+    for name, module in model.named_modules():  #找到GCBlock部分
+        if not isinstance(module, GCBlock):
+            continue    #不是GCBlock就跳过
+
+        weight_key, bias_key = f"{name}.weight", f"{name}.bias"
+        if weight_key not in fused_sd or bias_key not in fused_sd:
+            raise KeyError(f"Missing fused parameters for GCBlock '{name}' in fused_sd.")
+
+        target_kernel = fused_sd[weight_key]    #取融合后的等效卷积核（3×3 Conv 的权重）
+        target_bias = fused_sd[bias_key]    #取融合后的偏置
+
+        # Deploy-mode blocks can load the fused weights directly.
+        if module.deploy:
+            module.reparam_conv.weight.data.copy_(target_kernel)
+            module.reparam_conv.bias.data.copy_(target_bias)
+            continue
+
+        if variant == "A":
+            # Zero auxiliary branches so the 3x3 branch carries the fused weights.
+            """
+            核心思想：
+                让 “总输出 = 3×3 分支 + 1×1 分支 + identity 分支 = target 等效卷积”
+                现在我希望：1×1 分支 + identity 分支 = 0，那么 3×3 分支 = target 等效卷积。
+                下次训练时候1*1分支和identity分支从零开始训练
+            """
+            #处理1*1分支，将其置零
+            _zero_out_conv_branch(module.branch_1x1)
+            #处理identity分支
+            if isinstance(module.branch_identity, nn.BatchNorm2d):
+                module.branch_identity.weight.data.zero_()
+                module.branch_identity.bias.data.zero_()
+                module.branch_identity.running_mean.zero_()
+                module.branch_identity.running_var.fill_(1.0)
+                if hasattr(module.branch_identity, "num_batches_tracked"):
+                    module.branch_identity.num_batches_tracked.zero_()
+            else:
+                module.branch_identity = None
+            #由于其他分支被归零，所以“总效果全靠等效 3×3 分支”，
+            residual_kernel = target_kernel
+            residual_bias = target_bias
+        else:  # variant "B"
+            """
+            核心思想：
+                先把当前 1×1 + identity 分支的等效卷积算出来（aux_kernel, aux_bias），
+                然后：
+                    3x3_residual = target_kernel - aux_kernel
+                    3x3_bias_residual = target_bias - aux_bias
+                这样“3×3 分支 + 辅助分支 = target 效果”。
+            """
+            aux_kernel, aux_bias = module.get_auxiliary_equivalent_kernel_bias()
+            residual_kernel = target_kernel - aux_kernel
+            residual_bias = target_bias - aux_bias
+
+        # Write residual into the 3x3 branch with identity BatchNorm.
+        main_conv = module.branch_3x3[0]
+        main_conv.weight.data.copy_(residual_kernel)
+        if main_conv.bias is not None:
+            main_conv.bias.data.copy_(residual_bias)
+
+        if module.use_bn and len(module.branch_3x3) > 1:
+            _set_bn_to_identity(module.branch_3x3[1])
+        else:
+            # If BN is disabled and no conv bias exists, register bias via BN-like tensor.
+            # This path is unlikely but keeps logic consistent.
+            main_conv.bias = torch.nn.Parameter(residual_bias.clone())
 
 
 if __name__ == "__main__":
+
     test_gcblock()
